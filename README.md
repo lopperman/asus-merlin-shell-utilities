@@ -172,13 +172,6 @@ Build/rebuild the MAC-to-hostname mapping file. Sources data from:
 2. dnsmasq.leases dynamic entries
 3. Router infrastructure MACs (backhaul, fronthaul, wifi interfaces)
 
-#### `map_macs` example output
-
-<p align="center">
-  <img src="/readme_images/macblock.png?raw=true" alt="macblock example" width="70%"/>
-</p>
-
-
 ### `map_macs_show`
 
 Display the current MAC mapping file sorted by hostname.
@@ -208,6 +201,11 @@ macblock roku
 **Note:** Blocks are not persistent and will be lost on router reboot.
 
 #### `macblock` example
+
+<p align="center">
+  <img src="/readme_images/macblock.png?raw=true" alt="macblock example" width="70%"/>
+</p>
+
 
 ```zsh
 macblock cam_
