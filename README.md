@@ -12,7 +12,8 @@ This project provides shell functions that make it easier to:
 - Manage network devices with intuitive commands
 
 <p align="center">
-  <img src="/readme_images/ebt-report.png?raw=true" alt="ebt-table output" width="70%"/>
+  <img src="/readme_images/ebt-report.png?raw=true" alt="ebt-table output" width="45%"/>
+  <img src="/readme_images/ebt-report-end.png?raw=true" alt="ebt-table output" width="45%"/>
 </p>
 
 
