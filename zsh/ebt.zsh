@@ -329,6 +329,13 @@ _ebt_format_rule() {
     if [[ "$use_color" == "true" ]]; then
         formatted="${formatted//-j DROP/${_EBT_COLORS[red]}-j DROP${_EBT_COLORS[reset]}}"
         formatted="${formatted//-j ACCEPT/${_EBT_COLORS[green]}-j ACCEPT${_EBT_COLORS[reset]}}"
+        # Color the counters (from --Lc output) in magenta
+        if [[ "$formatted" =~ ', pcnt = [0-9]+ -- bcnt = [0-9]+' ]]; then
+            formatted="${formatted//, pcnt =/${_EBT_COLORS[magenta]}, pcnt =}"
+            formatted="${formatted//-- bcnt = /-- bcnt = }"
+            # Find where the bcnt value ends and add reset
+            formatted=$(echo "$formatted" | sed -E "s/(bcnt = [0-9]+)/\1${_EBT_COLORS[reset]}/")
+        fi
     fi
 
     # Add description
@@ -345,8 +352,9 @@ _ebt_format_rule() {
 }
 
 # Normalize rule for comparison
+# Strips counters (from --Lc) before normalizing so rules match regardless of counter values
 _ebt_normalize_rule() {
-    echo "$1" | tr -s ' ' | sed 's/^ *//' | awk '{
+    echo "$1" | sed 's/, pcnt = [0-9]* -- bcnt = [0-9]*//' | tr -s ' ' | sed 's/^ *//' | awk '{
         for(i=1;i<=NF;i++) {
             if($i ~ /^[0-9a-fA-F:]+$/ && length($i) >= 11 && index($i,":") > 0) {
                 n = split($i, parts, ":")
@@ -436,6 +444,7 @@ ebt-report() {
     local refresh_macs=""
     local unique_only=false
     local mask_mac=false
+    local show_count=false
     local -a selected_routers=()
 
     # Parse arguments
@@ -446,6 +455,7 @@ ebt-report() {
             --refresh|-r) refresh_macs="--refresh"; shift ;;
             --unique|-u) unique_only=true; shift ;;
             --maskmac|-m) mask_mac=true; shift ;;
+            --count) show_count=true; shift ;;
             --router|-R)
                 local resolved=$(_ebt_resolve_router "$2")
                 if [[ -z "$resolved" ]]; then
@@ -477,6 +487,7 @@ HELPHEADER
     --chain, -c CHAIN    Filter by chain (INPUT, FORWARD, OUTPUT)
     --refresh, -r        Refresh MAC mapping before report
     --maskmac, -m        Mask last two octets of MAC addresses (xx:xx)
+    --count              Show packet/byte counters (highlighted in magenta)
     --no-color, -n       Disable colored output
     --help, -h           Show this help
 
@@ -487,6 +498,7 @@ EXAMPLES
     ebt-report --unique            Show only rules that differ between routers
     ebt-report -c FORWARD          Show only FORWARD chain rules
     ebt-report --maskmac           Show rules with masked MAC addresses
+    ebt-report --count             Show rules with packet/byte counters
 
 CONFIGURATION
     Edit the USER CONFIGURATION section at the top of ebt.zsh:
@@ -563,8 +575,10 @@ HELPBODY
     typeset -A router_data
     for ip in ${(k)active_routers}; do
         echo "  Fetching from $ip (${active_routers[$ip]})..."
-        local filter_data=$(_ebt_ssh "$ip" "ebtables -L")
-        local nat_data=$(_ebt_ssh "$ip" "ebtables -t nat -L")
+        local ebt_opts="-L"
+        [[ "$show_count" == "true" ]] && ebt_opts="-L --Lc"
+        local filter_data=$(_ebt_ssh "$ip" "ebtables $ebt_opts")
+        local nat_data=$(_ebt_ssh "$ip" "ebtables -t nat $ebt_opts")
         # Combine both tables, prefixing nat chains to distinguish them
         router_data[$ip]="${filter_data}"$'\n'"${nat_data}"
     done
