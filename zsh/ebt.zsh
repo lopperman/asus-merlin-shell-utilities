@@ -559,11 +559,14 @@ HELPBODY
     echo "  Loading hostname cache..."
     _ebt_build_hostname_cache "$refresh_macs"
 
-    # Fetch ebtables from selected routers
+    # Fetch ebtables from selected routers (both filter and nat tables)
     typeset -A router_data
     for ip in ${(k)active_routers}; do
         echo "  Fetching from $ip (${active_routers[$ip]})..."
-        router_data[$ip]=$(_ebt_ssh "$ip" "ebtables -L")
+        local filter_data=$(_ebt_ssh "$ip" "ebtables -L")
+        local nat_data=$(_ebt_ssh "$ip" "ebtables -t nat -L")
+        # Combine both tables, prefixing nat chains to distinguish them
+        router_data[$ip]="${filter_data}"$'\n'"${nat_data}"
     done
 
     # First pass: identify common rules (present on all selected routers)
@@ -760,7 +763,12 @@ ebt-raw() {
     fi
 
     echo "Fetching ebtables from $ip (${_EBT_ROUTERS[$ip]})..."
+    echo ""
+    echo "=== Filter Table ==="
     _ebt_ssh "$ip" "ebtables -L"
+    echo ""
+    echo "=== NAT Table ==="
+    _ebt_ssh "$ip" "ebtables -t nat -L"
 }
 
 # Band number to friendly name
@@ -963,7 +971,7 @@ map_macs_show() {
 
 # Show ebtables status for a MAC across all configured routers
 _ebt_show_mac_status() {
-    local mac="$1" device_info="$2"
+    local mac="$1" device_info="$2" mask_mac="${3:-false}"
     # Extract last 3 octets for grep (avoids leading zero issues)
     local mac_tail
     mac_tail=$(echo "$mac" | awk -F: '{print $(NF-2)":"$(NF-1)":"$NF}')
@@ -979,7 +987,12 @@ _ebt_show_mac_status() {
         echo "${_EBT_COLORS[yellow]}** ${shortname} ($ip)${_EBT_COLORS[reset]}"
         ebt_out=$(_ebt_ssh "$ip" "ebtables -L" | grep -i "$mac_tail")
         if [[ -n "$ebt_out" ]]; then
-            echo "$ebt_out"
+            if [[ "$mask_mac" == "true" ]]; then
+                # Mask all MAC addresses in the output (handle 1-2 hex digits per octet)
+                echo "$ebt_out" | sed -E 's/([0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}):[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}/\1:xx:xx/g'
+            else
+                echo "$ebt_out"
+            fi
         else
             echo "  (no entries)"
         fi
@@ -988,23 +1001,28 @@ _ebt_show_mac_status() {
 }
 
 # Run ebtables unblock commands on a router
+# Removes both DROP rules and MARK rules (in case device was blocked with --reject)
 _ebt_unblock_mac() {
     local ip="$1" mac="$2"
     local cmd="ebtables -D FORWARD -s $mac -j DROP 2>/dev/null; \
 ebtables -D FORWARD -d $mac -j DROP 2>/dev/null; \
 ebtables -D INPUT -s $mac -j DROP 2>/dev/null; \
-ebtables -D OUTPUT -d $mac -j DROP 2>/dev/null"
+ebtables -D OUTPUT -d $mac -j DROP 2>/dev/null; \
+ebtables -D FORWARD -s $mac -j mark --mark-set 0x100 --mark-target ACCEPT 2>/dev/null; \
+ebtables -D FORWARD -d $mac -j mark --mark-set 0x100 --mark-target ACCEPT 2>/dev/null"
     _ebt_ssh "$ip" "$cmd"
 }
 
-# Run ebtables block commands on a router
+# Run ebtables block commands on a router (silent DROP mode)
 _ebt_block_mac() {
     local ip="$1" mac="$2"
-    # First delete any existing rules (to avoid duplicates), then insert new ones
+    # First delete any existing rules (DROP or MARK) to avoid duplicates, then insert DROP rules
     local cmd="ebtables -D FORWARD -s $mac -j DROP 2>/dev/null; \
 ebtables -D FORWARD -d $mac -j DROP 2>/dev/null; \
 ebtables -D INPUT -s $mac -j DROP 2>/dev/null; \
 ebtables -D OUTPUT -d $mac -j DROP 2>/dev/null; \
+ebtables -D FORWARD -s $mac -j mark --mark-set 0x100 --mark-target ACCEPT 2>/dev/null; \
+ebtables -D FORWARD -d $mac -j mark --mark-set 0x100 --mark-target ACCEPT 2>/dev/null; \
 ebtables -I FORWARD -s $mac -j DROP; \
 ebtables -I FORWARD -d $mac -j DROP; \
 ebtables -I INPUT -s $mac -j DROP; \
@@ -1012,15 +1030,40 @@ ebtables -I OUTPUT -d $mac -j DROP"
     _ebt_ssh "$ip" "$cmd"
 }
 
+# Run ebtables block commands on a router (REJECT mode via mark + iptables)
+# Marks packets for iptables REJECT instead of silent DROP
+# Requires iptables rules to be set up on router startup:
+#   iptables -I FORWARD -m mark --mark 0x100 -j REJECT --reject-with icmp-port-unreachable
+#   iptables -I FORWARD -m mark --mark 0x100 -p tcp -j REJECT --reject-with tcp-reset
+_ebt_block_mac_reject() {
+    local ip="$1" mac="$2"
+    # First delete any existing rules (DROP or MARK) to avoid duplicates, then insert MARK rules
+    local cmd="ebtables -D FORWARD -s $mac -j DROP 2>/dev/null; \
+ebtables -D FORWARD -d $mac -j DROP 2>/dev/null; \
+ebtables -D INPUT -s $mac -j DROP 2>/dev/null; \
+ebtables -D OUTPUT -d $mac -j DROP 2>/dev/null; \
+ebtables -D FORWARD -s $mac -j mark --mark-set 0x100 --mark-target ACCEPT 2>/dev/null; \
+ebtables -D FORWARD -d $mac -j mark --mark-set 0x100 --mark-target ACCEPT 2>/dev/null; \
+ebtables -I FORWARD -s $mac -j mark --mark-set 0x100 --mark-target ACCEPT; \
+ebtables -I FORWARD -d $mac -j mark --mark-set 0x100 --mark-target ACCEPT"
+    _ebt_ssh "$ip" "$cmd"
+}
+
 # Block/unblock device at Layer 2 across all configured routers
 macblock() {
-    local host="$1"
-    if [[ -z "$host" || "$host" == "--help" || "$host" == "-h" ]]; then
-        cat <<'HELPTEXT'
+    local mask_mac=false
+    local host=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --maskmac|-m) mask_mac=true; shift ;;
+            --help|-h)
+                cat <<'HELPTEXT'
 macblock - Block or unblock a device at Layer 2 across all AiMesh routers
 
 USAGE
-    macblock <ip_address|mac_address|hostname>
+    macblock [options] <ip_address|mac_address|hostname>
 
 DESCRIPTION
     Interactively block or unblock a device at Layer 2 using ebtables.
@@ -1035,6 +1078,10 @@ DESCRIPTION
     primary router. If ebtables rules only exist on the primary router, a
     blocked device connected to a mesh node could still communicate with
     other devices on that same node.
+
+OPTIONS
+    --maskmac, -m    Mask last two octets of MAC addresses (xx:xx)
+    --help, -h       Show this help
 
 ARGUMENTS
     ip_address    IPv4 address (e.g., 192.168.1.100)
@@ -1053,13 +1100,18 @@ EXAMPLES
     macblock aa:bb:cc:dd:ee:ff   Block/unblock by MAC address
     macblock iphone              Search for devices with 'iphone' in name
     macblock roku                Search for Roku devices
+    macblock -m iphone           Search with masked MAC output
 
 HOW IT WORKS
     1. Finds the device's MAC address (from input or lookup)
-    2. Shows current device info and prompts for action
-    3. On block: Inserts DROP rules in FORWARD, INPUT, OUTPUT chains
-    4. On unblock: Deletes any existing DROP rules for that MAC
-    5. Rules are applied to all routers in _EBT_ROUTERS
+    2. Shows device info and prompts for action (block/reject/unblock)
+    3. Block (b): Inserts DROP rules - silent, device retries until timeout
+    4. Reject (r): Inserts MARK rules that trigger iptables REJECT
+       - TCP packets receive RST (immediate connection refused)
+       - Other packets receive ICMP port-unreachable
+       - Requires iptables REJECT rules on router startup
+    5. Unblock (u): Deletes any existing DROP or MARK rules for that MAC
+    6. Rules are applied to all routers in _EBT_ROUTERS
 
 NOTES
     - Blocks are not persistent; they are lost on router reboot
@@ -1076,7 +1128,17 @@ COMPATIBILITY
     Platforms: macOS, Linux, Windows+WSL (with zsh installed)
                NOT compatible with bash, Git Bash, or PowerShell
 HELPTEXT
-        return 0
+                return 0
+                ;;
+            -*) echo "Unknown option: $1"; return 1 ;;
+            *) host="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$host" ]]; then
+        echo "Usage: macblock [--maskmac|-m] <ip_address|mac_address|hostname>"
+        echo "Try 'macblock --help' for more information."
+        return 1
     fi
 
     local primary_ip=$(_ebt_get_primary)
@@ -1172,7 +1234,9 @@ HELPTEXT
         for match in "${matches[@]}"; do
             local m_mac="${match%%|*}"
             local m_host="${match#*|}"
-            printf "  ${_EBT_COLORS[yellow]}%2d${_EBT_COLORS[reset]}) %-20s %s\n" "$i" "$m_mac" "${m_host:-(unnamed)}"
+            local display_mac="$m_mac"
+            [[ "$mask_mac" == "true" ]] && display_mac=$(_ebt_mask_mac "$m_mac")
+            printf "  ${_EBT_COLORS[yellow]}%2d${_EBT_COLORS[reset]}) %-20s %s\n" "$i" "$display_mac" "${m_host:-(unnamed)}"
             ((i++))
         done
         echo ""
@@ -1214,43 +1278,58 @@ HELPTEXT
     fi
 
     # Display device info
+    local display_mac="$mac"
+    [[ "$mask_mac" == "true" ]] && display_mac=$(_ebt_mask_mac "$mac")
+
     echo ""
     echo "${_EBT_COLORS[bold]}${_EBT_COLORS[cyan]}Device Found:${_EBT_COLORS[reset]}"
     echo "  Hostname: ${_EBT_COLORS[green]}${hostname:-unknown}${_EBT_COLORS[reset]}"
     echo "  IP:       ${_EBT_COLORS[green]}${ip:-unknown}${_EBT_COLORS[reset]}"
-    echo "  MAC:      ${_EBT_COLORS[green]}${mac}${_EBT_COLORS[reset]}"
+    echo "  MAC:      ${_EBT_COLORS[green]}${display_mac}${_EBT_COLORS[reset]}"
     echo ""
     echo "Options:"
     echo "  ${_EBT_COLORS[yellow]}e${_EBT_COLORS[reset]} - Exit"
-    echo "  ${_EBT_COLORS[yellow]}b${_EBT_COLORS[reset]} - Block device (Layer 2)"
+    echo "  ${_EBT_COLORS[yellow]}b${_EBT_COLORS[reset]} - Block device (silent DROP)"
+    echo "  ${_EBT_COLORS[yellow]}r${_EBT_COLORS[reset]} - Block device (REJECT - sends RST/ICMP, faster client timeout)"
     echo "  ${_EBT_COLORS[yellow]}u${_EBT_COLORS[reset]} - Unblock device"
     echo ""
-    read "choice?Enter choice [e/b/u]: "
+    read "choice?Enter choice [e/b/r/u]: "
 
-    local device_info="${hostname:-unknown} (${ip:-$mac})"
+    local device_info="${hostname:-unknown} (${ip:-$display_mac})"
 
     case "$choice" in
         u|U)
             echo ""
-            echo "${_EBT_COLORS[cyan]}Unblocking $mac on all routers...${_EBT_COLORS[reset]}"
-            for ip in ${(ko)_EBT_ROUTERS}; do
-                local shortname=$(_ebt_get_shortname "$ip")
+            echo "${_EBT_COLORS[cyan]}Unblocking $display_mac on all routers...${_EBT_COLORS[reset]}"
+            for rtr_ip in ${(ko)_EBT_ROUTERS}; do
+                local shortname=$(_ebt_get_shortname "$rtr_ip")
                 echo "  → $shortname"
-                _ebt_unblock_mac "$ip" "$mac"
+                _ebt_unblock_mac "$rtr_ip" "$mac"
             done
             echo "${_EBT_COLORS[green]}Done. Device unblocked.${_EBT_COLORS[reset]}"
-            _ebt_show_mac_status "$mac" "$device_info"
+            _ebt_show_mac_status "$mac" "$device_info" "$mask_mac"
             ;;
         b|B)
             echo ""
-            echo "${_EBT_COLORS[cyan]}Blocking $mac on all routers...${_EBT_COLORS[reset]}"
-            for ip in ${(ko)_EBT_ROUTERS}; do
-                local shortname=$(_ebt_get_shortname "$ip")
+            echo "${_EBT_COLORS[cyan]}Blocking $display_mac on all routers (silent DROP)...${_EBT_COLORS[reset]}"
+            for rtr_ip in ${(ko)_EBT_ROUTERS}; do
+                local shortname=$(_ebt_get_shortname "$rtr_ip")
                 echo "  → $shortname"
-                _ebt_block_mac "$ip" "$mac"
+                _ebt_block_mac "$rtr_ip" "$mac"
             done
-            echo "${_EBT_COLORS[green]}Done. Device blocked at Layer 2.${_EBT_COLORS[reset]}"
-            _ebt_show_mac_status "$mac" "$device_info"
+            echo "${_EBT_COLORS[green]}Done. Device blocked at Layer 2 (silent DROP).${_EBT_COLORS[reset]}"
+            _ebt_show_mac_status "$mac" "$device_info" "$mask_mac"
+            ;;
+        r|R)
+            echo ""
+            echo "${_EBT_COLORS[cyan]}Blocking $display_mac on all routers (REJECT mode)...${_EBT_COLORS[reset]}"
+            for rtr_ip in ${(ko)_EBT_ROUTERS}; do
+                local shortname=$(_ebt_get_shortname "$rtr_ip")
+                echo "  → $shortname"
+                _ebt_block_mac_reject "$rtr_ip" "$mac"
+            done
+            echo "${_EBT_COLORS[green]}Done. Device blocked (REJECT mode - clients will receive RST/ICMP).${_EBT_COLORS[reset]}"
+            _ebt_show_mac_status "$mac" "$device_info" "$mask_mac"
             ;;
         *)
             echo "Exiting."
