@@ -8,8 +8,7 @@ This project provides shell functions that make it easier to:
 
 - View and compare ebtables (Layer 2 firewall) rules across AiMesh routers
 - Resolve MAC addresses to hostnames using DHCP data
-- Block/unblock devices at Layer 2 across your entire mesh network
-- Manage network devices with intuitive commands
+- Identify common vs unique rules across mesh nodes
 
 <p align="center">
   <img src="/readme_images/ebt-report.png?raw=true" alt="ebt-table output" width="45%"/>
@@ -97,16 +96,35 @@ _EBT_ROUTERS=(
 
 ### SSH Configuration
 
-Define the SSH command for each router:
+Define the SSH command for each router. The username is read from environment variables:
 
 ```zsh
 typeset -gA _EBT_ROUTER_SSH
 _EBT_ROUTER_SSH=(
-    "192.168.1.1" "ssh admin@192.168.1.1"
-    "192.168.1.2" "ssh -p 2222 admin@192.168.1.2"
-    "192.168.1.3" "ssh -i ~/.ssh/router_key admin@192.168.1.3"
+    "192.168.1.1" "ssh $(_ebt_get_ssh_user 192.168.1.1)@192.168.1.1"
+    "192.168.1.2" "ssh -p 2222 $(_ebt_get_ssh_user 192.168.1.2)@192.168.1.2"
+    "192.168.1.3" "ssh -i ~/.ssh/router_key $(_ebt_get_ssh_user 192.168.1.3)@192.168.1.3"
 )
 ```
+
+### SSH Username Environment Variables
+
+Set these in your `~/.zshrc` **before** sourcing `ebt.zsh`:
+
+```zsh
+# Per-router usernames (based on shortnames in _EBT_ROUTERS)
+export EBT_SSH_USER_PRIMARY="admin"
+export EBT_SSH_USER_NODE1="admin"
+export EBT_SSH_USER_NODE2="admin"
+
+# Or use a single username for all routers:
+export EBT_SSH_USER="admin"
+```
+
+The username lookup order is:
+1. `EBT_SSH_USER_<SHORTNAME>` (e.g., `EBT_SSH_USER_PRIMARY` for a router with shortname "Primary")
+2. `EBT_SSH_USER` (fallback for all routers)
+3. `"admin"` (default if no env vars set)
 
 ### Prerequisites
 
@@ -149,6 +167,8 @@ ebt-report --no-color
 | `-u, --unique` | Only show rules unique to selected routers |
 | `-c, --chain CHAIN` | Filter by chain (INPUT, FORWARD, OUTPUT) |
 | `-r, --refresh` | Refresh MAC mapping before report |
+| `-m, --maskmac` | Mask last two octets of MAC addresses (xx:xx) |
+| `--count [MIN]` | Show packet/byte counters; optionally filter by minimum packet count |
 | `-n, --no-color` | Disable colored output |
 | `-h, --help` | Show help |
 
@@ -178,107 +198,6 @@ Display the current MAC mapping file sorted by hostname.
 
 ```bash
 map_macs_show
-```
-
-### `macblock`
-
-Interactively block or unblock a device at Layer 2 across all AiMesh routers.
-
-```bash
-# Block/unblock by IP address
-macblock 192.168.1.100
-
-# Block/unblock by MAC address
-macblock aa:bb:cc:dd:ee:ff
-
-# Search for devices by hostname
-macblock iphone
-macblock roku
-```
-
-**Why block on all routers?** In an AiMesh network, traffic between devices on the same mesh node stays local to that node. If ebtables rules only exist on the primary router, a blocked device connected to a mesh node could still communicate with other devices on that same node.
-
-**Note:** Blocks are not persistent and will be lost on router reboot.
-
-#### `macblock` example
-
-<p align="center">
-  <img src="/readme_images/macblock.png?raw=true" alt="macblock example" width="70%"/>
-</p>
-
-
-```zsh
-macblock cam_
-Searching for hostname matching 'cam_'...
-
-Found 9 matching device(s):
-
-   1) d0:3f:27:XX:XX:XX    cam_garage
-   2) d0:3f:27:XX:XX:XX    cam_maggie
-   3) d0:3f:27:XX:XX:XX    cam_family
-   4) 80:48:2c:XX:XX:XX    cam_fronttop
-   5) 80:48:2c:XX:XX:XX    cam_front
-   6) d0:3f:27:XX:XX:XX    cam_bsmnt
-   7) d0:3f:27:XX:XX:XX    cam_backyard
-   8) 80:48:2c:XX:XX:XX    cam_ofcwindow
-   9) d0:3f:27:XX:XX:XX    cam_wkshp
-
-   0) Cancel
-
-Select device [0-9]: 7
-
-Device Found:
-  Hostname: cam_backyard
-  IP:       10.10.3.110
-  MAC:      d0:3f:27:XX:XX:XX
-
-Options:
-  e - Exit
-  b - Block device (Layer 2)
-  u - Unblock device
-
-Enter choice [e/b/u]: b
-
-Blocking d0:3f:27:XX:XX:XX on all routers...
-  → Primary
-  → Mesh1
-  → Mesh2
-Done. Device blocked at Layer 2.
-
-Current ebtables entries for cam_backyard (10.10.3.110):
-
-** Primary (10.10.3.1)
--s d0:3f:27:XX:XX:XX -j DROP
--d d0:3f:27:XX:XX:XX -j DROP
--s d0:3f:27:XX:XX:XX -j DROP
--s d0:3f:27:XX:XX:XX -d Broadcast -j ACCEPT
--s d0:3f:27:XX:XX:XX -d 60:cf:84:XX:XX:XX -j ACCEPT
--s d0:3f:27:XX:XX:XX -d 70:b3:6:XX:XX:XX -j ACCEPT
--s d0:3f:27:XX:XX:XX -d f0:99:b6:XX:XX:XX -j ACCEPT
--s d0:3f:27:XX:XX:XX -d e0:33:8e:XX:XX:XX -j ACCEPT
--d d0:3f:27:XX:XX:XX -j DROP
-
-** Mesh1 (10.10.3.2)
--s d0:3f:27:XX:XX:XX -j DROP
--d d0:3f:27:XX:XX:XX -j DROP
--s d0:3f:27:XX:XX:XX -j DROP
--s d0:3f:27:XX:XX:XX -d Broadcast -j ACCEPT
--s d0:3f:27:XX:XX:XX -d 60:cf:84:51:db:c0 -j ACCEPT
--s d0:3f:27:XX:XX:XX -d 70:b3:6:9:a3:9d -j ACCEPT
--s d0:3f:27:XX:XX:XX -d f0:99:b6:11:39:1 -j ACCEPT
--s d0:3f:27:XX:XX:XX -d e0:33:8e:e8:52:f5 -j ACCEPT
--d d0:3f:27:XX:XX:XX -j DROP
-
-** Mesh2 (10.10.3.3)
--s d0:3f:27:XX:XX:XX -j DROP
--d d0:3f:27:XX:XX:XX -j DROP
--s d0:3f:27:XX:XX:XX -j DROP
--s d0:3f:27:XX:XX:XX -d Broadcast -j ACCEPT
--s d0:3f:27:XX:XX:XX -d 60:cf:84:XX:XX:XX -j ACCEPT
--s d0:3f:27:XX:XX:XX -d 70:b3:6:XX:XX:XX -j ACCEPT
--s d0:3f:27:XX:XX:XX -d f0:99:b6:XX:XX:XX -j ACCEPT
--s d0:3f:27:XX:XX:XX -d e0:33:8e:XX:XX:XX -j ACCEPT
--d d0:3f:27:XX:XX:XX -j DROP
 ```
 
 ## How It Works
@@ -316,41 +235,6 @@ $ ebt-report -R primary
 
   -s aa:bb:cc:dd:ee:ff (iPhone-John) -j DROP  # Block from this source
   -d aa:bb:cc:dd:ee:ff (iPhone-John) -j DROP  # Block to this dest
-```
-
-### Block a device by searching hostname
-
-```
-$ macblock roku
-
-Searching for hostname matching 'roku'...
-
-Found 2 matching device(s):
-
-   1) aa:bb:cc:11:22:33   Roku-Living-Room
-   2) aa:bb:cc:44:55:66   Roku-Bedroom
-
-   0) Cancel
-
-Select device [0-2]: 1
-
-Device Found:
-  Hostname: Roku-Living-Room
-  IP:       192.168.1.150
-  MAC:      aa:bb:cc:11:22:33
-
-Options:
-  e - Exit
-  b - Block device (Layer 2)
-  u - Unblock device
-
-Enter choice [e/b/u]: b
-
-Blocking aa:bb:cc:11:22:33 on all routers...
-  → Primary
-  → Node1
-  → Node2
-Done. Device blocked at Layer 2.
 ```
 
 ## Contributing

@@ -36,17 +36,46 @@ _EBT_ROUTERS=(
     "10.10.3.3" "AX88U-Pro (Mesh2)"
 )
 
+# Get SSH username for a router from environment variable
+# Looks for EBT_SSH_USER_<SHORTNAME> (uppercase), falls back to EBT_SSH_USER
+_ebt_get_ssh_user() {
+    local ip="$1"
+    local desc="${_EBT_ROUTERS[$ip]}"
+    local shortname=""
+
+    # Extract shortname from parentheses (same logic as _ebt_get_shortname)
+    if [[ "$desc" =~ '\(([^)]+)\)' ]]; then
+        shortname="${match[1]}"
+    else
+        shortname="$desc"
+    fi
+
+    local varname="EBT_SSH_USER_${shortname:u}"  # :u = uppercase
+    local user="${(P)varname}"  # indirect variable expansion
+
+    if [[ -z "$user" ]]; then
+        user="${EBT_SSH_USER:-admin}"  # fallback to EBT_SSH_USER or "admin"
+    fi
+    echo "$user"
+}
+
 # SSH command to reach each router
 # Must accept a command string as the final argument
-# Examples:
-#   "ssh admin@192.168.1.1"                    # default port 22, key auth
-#   "ssh -p 2222 admin@192.168.1.1"            # custom port
-#   "ssh -i ~/.ssh/router_key admin@192.168.1.1"  # specific key
+#
+# SSH username is read from environment variables:
+#   EBT_SSH_USER_<SHORTNAME>  - per-router (e.g., EBT_SSH_USER_PRIMARY, EBT_SSH_USER_MESH1)
+#   EBT_SSH_USER              - fallback for all routers (default: "admin")
+# Shortnames are derived from _EBT_ROUTERS above (uppercase)
+#
+# Examples for _EBT_ROUTER_SSH entries:
+#   "ssh $(_ebt_get_ssh_user 192.168.1.1)@192.168.1.1"           # default port 22
+#   "ssh -p 2222 $(_ebt_get_ssh_user 192.168.1.1)@192.168.1.1"   # custom port
+#   "ssh -i ~/.ssh/router_key $(_ebt_get_ssh_user 192.168.1.1)@192.168.1.1"  # specific key
 typeset -gA _EBT_ROUTER_SSH
 _EBT_ROUTER_SSH=(
-    "10.10.3.1" "ssh -p 202 pdbAdmin@10.10.3.1"
-    "10.10.3.2" "ssh -p 202 pdbAdmin@10.10.3.2"
-    "10.10.3.3" "ssh -p 202 pdbAdmin@10.10.3.3"
+    "10.10.3.1" "ssh -p 202 $(_ebt_get_ssh_user 10.10.3.1)@10.10.3.1"
+    "10.10.3.2" "ssh -p 202 $(_ebt_get_ssh_user 10.10.3.2)@10.10.3.2"
+    "10.10.3.3" "ssh -p 202 $(_ebt_get_ssh_user 10.10.3.3)@10.10.3.3"
 )
 
 # MAC mapping file location (where hostname lookups are cached)
@@ -266,6 +295,17 @@ _ebt_describe_rule() {
     fi
 }
 
+# Extract packet count from rule line (from --Lc output)
+# Returns the packet count or 0 if not found
+_ebt_get_pcnt() {
+    local rule="$1"
+    if [[ "$rule" =~ 'pcnt = ([0-9]+)' ]]; then
+        echo "${match[1]}"
+    else
+        echo "0"
+    fi
+}
+
 # Format a rule with resolved hostnames and colors
 # Args: rule, use_color, src_pad_width, mask_mac (optional)
 _ebt_format_rule() {
@@ -445,6 +485,7 @@ ebt-report() {
     local unique_only=false
     local mask_mac=false
     local show_count=false
+    local min_count=0
     local -a selected_routers=()
 
     # Parse arguments
@@ -455,7 +496,15 @@ ebt-report() {
             --refresh|-r) refresh_macs="--refresh"; shift ;;
             --unique|-u) unique_only=true; shift ;;
             --maskmac|-m) mask_mac=true; shift ;;
-            --count) show_count=true; shift ;;
+            --count)
+                show_count=true
+                # Check if next arg is a positive integer (optional min count)
+                if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                    min_count="$2"
+                    shift
+                fi
+                shift
+                ;;
             --router|-R)
                 local resolved=$(_ebt_resolve_router "$2")
                 if [[ -z "$resolved" ]]; then
@@ -487,7 +536,9 @@ HELPHEADER
     --chain, -c CHAIN    Filter by chain (INPUT, FORWARD, OUTPUT)
     --refresh, -r        Refresh MAC mapping before report
     --maskmac, -m        Mask last two octets of MAC addresses (xx:xx)
-    --count              Show packet/byte counters (highlighted in magenta)
+    --count [MIN]        Show packet/byte counters (highlighted in magenta)
+                         If MIN is specified, only show rules with packet
+                         count >= MIN (useful for finding active rules)
     --no-color, -n       Disable colored output
     --help, -h           Show this help
 
@@ -498,7 +549,9 @@ EXAMPLES
     ebt-report --unique            Show only rules that differ between routers
     ebt-report -c FORWARD          Show only FORWARD chain rules
     ebt-report --maskmac           Show rules with masked MAC addresses
-    ebt-report --count             Show rules with packet/byte counters
+    ebt-report --count             Show all rules with packet/byte counters
+    ebt-report --count 10          Show only rules with >= 10 packet hits
+    ebt-report --count 1           Show only rules that have been triggered
 
 CONFIGURATION
     Edit the USER CONFIGURATION section at the top of ebt.zsh:
@@ -517,17 +570,19 @@ CONFIGURATION
 
     _EBT_ROUTER_SSH - SSH command for each router IP
         - Must accept a command string as the final argument
+        - Username comes from environment variables (set in .zshrc):
+            EBT_SSH_USER_<SHORTNAME>  per-router (e.g., EBT_SSH_USER_PRIMARY)
+            EBT_SSH_USER              fallback for all routers (default: admin)
         Example:
             _EBT_ROUTER_SSH=(
-                "192.168.1.1" "ssh admin@192.168.1.1"
-                "192.168.1.2" "ssh -p 2222 admin@192.168.1.2"
+                "192.168.1.1" "ssh $(_ebt_get_ssh_user 192.168.1.1)@192.168.1.1"
+                "192.168.1.2" "ssh -p 2222 $(_ebt_get_ssh_user 192.168.1.2)@192.168.1.2"
             )
 
 RELATED COMMANDS
     ebt-raw [ROUTER]    Show raw ebtables output from a single router
     map_macs            Rebuild the MAC-to-hostname mapping file
     map_macs_show       Display the current MAC mapping
-    macblock            Interactively block/unblock a device
 
 COMPATIBILITY
     Shell:     zsh required (uses zsh-specific syntax)
@@ -661,6 +716,14 @@ HELPBODY
                     local is_common=0
                     [[ -n "${common_rules[$key]}" ]] && is_common=1
 
+                    # Filter by minimum packet count if --count with threshold is specified
+                    if [[ "$show_count" == "true" && $min_count -gt 0 ]]; then
+                        local pcnt=$(_ebt_get_pcnt "$line")
+                        if [[ $pcnt -lt $min_count ]]; then
+                            continue
+                        fi
+                    fi
+
                     display_rules+=("$current_chain|$line|$is_common")
                     ((total_count++))
                     [[ $is_common -eq 0 ]] && ((unique_count++))
@@ -761,6 +824,9 @@ HELPBODY
     elif [[ $active_count -gt 1 ]]; then
         echo ""
         echo "  ${_EBT_COLORS[dim]}● = common rule (present on all selected routers)${_EBT_COLORS[reset]}"
+    fi
+    if [[ "$show_count" == "true" && $min_count -gt 0 ]]; then
+        echo "  ${_EBT_COLORS[dim]}(filtered: showing rules with pcnt >= $min_count)${_EBT_COLORS[reset]}"
     fi
 }
 
@@ -977,376 +1043,4 @@ map_macs_show() {
             printf "${_EBT_COLORS[cyan]}%-20s${_EBT_COLORS[reset]} ${_EBT_COLORS[dim]}(unnamed)${_EBT_COLORS[reset]}\n" "$mac"
         fi
     done
-}
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAC BLOCKING FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# Show ebtables status for a MAC across all configured routers
-_ebt_show_mac_status() {
-    local mac="$1" device_info="$2" mask_mac="${3:-false}"
-    # Extract last 3 octets for grep (avoids leading zero issues)
-    local mac_tail
-    mac_tail=$(echo "$mac" | awk -F: '{print $(NF-2)":"$(NF-1)":"$NF}')
-
-    echo ""
-    echo "${_EBT_COLORS[bold]}${_EBT_COLORS[cyan]}Current ebtables entries for ${device_info}:${_EBT_COLORS[reset]}"
-    echo ""
-
-    local ebt_out
-    local shortname
-    for ip in ${(ko)_EBT_ROUTERS}; do
-        shortname=$(_ebt_get_shortname "$ip")
-        echo "${_EBT_COLORS[yellow]}** ${shortname} ($ip)${_EBT_COLORS[reset]}"
-        ebt_out=$(_ebt_ssh "$ip" "ebtables -L" | grep -i "$mac_tail")
-        if [[ -n "$ebt_out" ]]; then
-            if [[ "$mask_mac" == "true" ]]; then
-                # Mask all MAC addresses in the output (handle 1-2 hex digits per octet)
-                echo "$ebt_out" | sed -E 's/([0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}):[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,2}/\1:xx:xx/g'
-            else
-                echo "$ebt_out"
-            fi
-        else
-            echo "  (no entries)"
-        fi
-        echo ""
-    done
-}
-
-# Run ebtables unblock commands on a router
-# Removes both DROP rules and MARK rules (in case device was blocked with --reject)
-_ebt_unblock_mac() {
-    local ip="$1" mac="$2"
-    local cmd="ebtables -D FORWARD -s $mac -j DROP 2>/dev/null; \
-ebtables -D FORWARD -d $mac -j DROP 2>/dev/null; \
-ebtables -D INPUT -s $mac -j DROP 2>/dev/null; \
-ebtables -D OUTPUT -d $mac -j DROP 2>/dev/null; \
-ebtables -D FORWARD -s $mac -j mark --mark-set 0x100 --mark-target ACCEPT 2>/dev/null; \
-ebtables -D FORWARD -d $mac -j mark --mark-set 0x100 --mark-target ACCEPT 2>/dev/null"
-    _ebt_ssh "$ip" "$cmd"
-}
-
-# Run ebtables block commands on a router (silent DROP mode)
-_ebt_block_mac() {
-    local ip="$1" mac="$2"
-    # First delete any existing rules (DROP or MARK) to avoid duplicates, then insert DROP rules
-    local cmd="ebtables -D FORWARD -s $mac -j DROP 2>/dev/null; \
-ebtables -D FORWARD -d $mac -j DROP 2>/dev/null; \
-ebtables -D INPUT -s $mac -j DROP 2>/dev/null; \
-ebtables -D OUTPUT -d $mac -j DROP 2>/dev/null; \
-ebtables -D FORWARD -s $mac -j mark --mark-set 0x100 --mark-target ACCEPT 2>/dev/null; \
-ebtables -D FORWARD -d $mac -j mark --mark-set 0x100 --mark-target ACCEPT 2>/dev/null; \
-ebtables -I FORWARD -s $mac -j DROP; \
-ebtables -I FORWARD -d $mac -j DROP; \
-ebtables -I INPUT -s $mac -j DROP; \
-ebtables -I OUTPUT -d $mac -j DROP"
-    _ebt_ssh "$ip" "$cmd"
-}
-
-# Run ebtables block commands on a router (REJECT mode via mark + iptables)
-# Marks packets for iptables REJECT instead of silent DROP
-# Requires iptables rules to be set up on router startup:
-#   iptables -I FORWARD -m mark --mark 0x100 -j REJECT --reject-with icmp-port-unreachable
-#   iptables -I FORWARD -m mark --mark 0x100 -p tcp -j REJECT --reject-with tcp-reset
-_ebt_block_mac_reject() {
-    local ip="$1" mac="$2"
-    # First delete any existing rules (DROP or MARK) to avoid duplicates, then insert MARK rules
-    local cmd="ebtables -D FORWARD -s $mac -j DROP 2>/dev/null; \
-ebtables -D FORWARD -d $mac -j DROP 2>/dev/null; \
-ebtables -D INPUT -s $mac -j DROP 2>/dev/null; \
-ebtables -D OUTPUT -d $mac -j DROP 2>/dev/null; \
-ebtables -D FORWARD -s $mac -j mark --mark-set 0x100 --mark-target ACCEPT 2>/dev/null; \
-ebtables -D FORWARD -d $mac -j mark --mark-set 0x100 --mark-target ACCEPT 2>/dev/null; \
-ebtables -I FORWARD -s $mac -j mark --mark-set 0x100 --mark-target ACCEPT; \
-ebtables -I FORWARD -d $mac -j mark --mark-set 0x100 --mark-target ACCEPT"
-    _ebt_ssh "$ip" "$cmd"
-}
-
-# Block/unblock device at Layer 2 across all configured routers
-macblock() {
-    local mask_mac=false
-    local host=""
-
-    # Parse arguments
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --maskmac|-m) mask_mac=true; shift ;;
-            --help|-h)
-                cat <<'HELPTEXT'
-macblock - Block or unblock a device at Layer 2 across all AiMesh routers
-
-USAGE
-    macblock [options] <ip_address|mac_address|hostname>
-
-DESCRIPTION
-    Interactively block or unblock a device at Layer 2 using ebtables.
-    When blocked, the device cannot communicate with any other device
-    on the network (complete network isolation).
-
-    Rules are applied to all configured routers to ensure the block
-    is effective regardless of which access point the device connects to.
-
-    Why all routers? In an AiMesh network, traffic between devices on the
-    same mesh node stays local to that node - it never passes through the
-    primary router. If ebtables rules only exist on the primary router, a
-    blocked device connected to a mesh node could still communicate with
-    other devices on that same node.
-
-OPTIONS
-    --maskmac, -m    Mask last two octets of MAC addresses (xx:xx)
-    --help, -h       Show this help
-
-ARGUMENTS
-    ip_address    IPv4 address (e.g., 192.168.1.100)
-                  Looks up MAC via DHCP leases or ARP
-
-    mac_address   Full MAC address (e.g., aa:bb:cc:dd:ee:ff)
-                  Used directly for ebtables rules
-
-    hostname      Partial hostname search (e.g., 'iphone', 'roku')
-                  Searches the MAC mapping file for matches.
-                  Case-insensitive wildcard match.
-                  Presents a selection menu if multiple matches found.
-
-EXAMPLES
-    macblock 192.168.1.100       Block/unblock by IP address
-    macblock aa:bb:cc:dd:ee:ff   Block/unblock by MAC address
-    macblock iphone              Search for devices with 'iphone' in name
-    macblock roku                Search for Roku devices
-    macblock -m iphone           Search with masked MAC output
-
-HOW IT WORKS
-    1. Finds the device's MAC address (from input or lookup)
-    2. Shows device info and prompts for action (block/reject/unblock)
-    3. Block (b): Inserts DROP rules - silent, device retries until timeout
-    4. Reject (r): Inserts MARK rules that trigger iptables REJECT
-       - TCP packets receive RST (immediate connection refused)
-       - Other packets receive ICMP port-unreachable
-       - Requires iptables REJECT rules on router startup
-    5. Unblock (u): Deletes any existing DROP or MARK rules for that MAC
-    6. Rules are applied to all routers in _EBT_ROUTERS
-
-NOTES
-    - Blocks are not persistent; they are lost on router reboot
-    - The MAC mapping file is auto-generated if it doesn't exist
-    - Use 'map_macs' to refresh the hostname mapping
-
-SEE ALSO
-    ebt-report    View ebtables rules across routers
-    map_macs      Rebuild MAC-to-hostname mapping
-
-COMPATIBILITY
-    Shell:     zsh required (uses zsh-specific syntax)
-    Firmware:  Asuswrt-Merlin (tested on 3004.388.x and 3006.102.x)
-    Platforms: macOS, Linux, Windows+WSL (with zsh installed)
-               NOT compatible with bash, Git Bash, or PowerShell
-HELPTEXT
-                return 0
-                ;;
-            -*) echo "Unknown option: $1"; return 1 ;;
-            *) host="$1"; shift ;;
-        esac
-    done
-
-    if [[ -z "$host" ]]; then
-        echo "Usage: macblock [--maskmac|-m] <ip_address|mac_address|hostname>"
-        echo "Try 'macblock --help' for more information."
-        return 1
-    fi
-
-    local primary_ip=$(_ebt_get_primary)
-    local mac="" ip="" hostname=""
-    local leases dnsmasq_conf
-
-    # Determine input type: MAC, IP, or hostname search
-    if [[ "$host" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
-        # Input is MAC address
-        mac="${host:l}"  # lowercase in zsh
-
-        # Fetch DHCP data to find hostname/IP
-        leases=$(_ebt_ssh "$primary_ip" "cat /var/lib/misc/dnsmasq.leases 2>/dev/null")
-        dnsmasq_conf=$(_ebt_ssh "$primary_ip" "cat /etc/dnsmasq.conf 2>/dev/null")
-
-        local lease_line
-        lease_line=$(echo "$leases" | grep -i "$mac")
-        if [[ -n "$lease_line" ]]; then
-            ip=$(echo "$lease_line" | awk '{print $3}')
-            hostname=$(echo "$lease_line" | awk '{print $4}')
-        else
-            # Try dnsmasq.conf static reservations (format: dhcp-host=MAC,hostname,IP)
-            local static_line
-            static_line=$(echo "$dnsmasq_conf" | grep -i "^dhcp-host=$mac" | head -1)
-            if [[ -n "$static_line" ]]; then
-                hostname=$(echo "$static_line" | cut -d',' -f2)
-                ip=$(echo "$static_line" | cut -d',' -f3)
-            fi
-        fi
-
-    elif [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        # Input is IP address
-        ip="$host"
-
-        # Fetch DHCP data to find MAC/hostname
-        leases=$(_ebt_ssh "$primary_ip" "cat /var/lib/misc/dnsmasq.leases 2>/dev/null")
-        dnsmasq_conf=$(_ebt_ssh "$primary_ip" "cat /etc/dnsmasq.conf 2>/dev/null")
-
-        local lease_line
-        lease_line=$(echo "$leases" | grep " $ip ")
-        if [[ -n "$lease_line" ]]; then
-            mac=$(echo "$lease_line" | awk '{print $2}')
-            mac="${mac:l}"  # lowercase in zsh
-            hostname=$(echo "$lease_line" | awk '{print $4}')
-        else
-            # Try dnsmasq.conf static reservations (format: dhcp-host=MAC,hostname,IP)
-            local static_line
-            static_line=$(echo "$dnsmasq_conf" | grep -i ",$ip$" | head -1)
-            if [[ -n "$static_line" ]]; then
-                mac=$(echo "$static_line" | sed 's/^dhcp-host=//' | cut -d',' -f1)
-                mac="${mac:l}"  # lowercase in zsh
-                hostname=$(echo "$static_line" | cut -d',' -f2)
-            fi
-        fi
-
-        # If no MAC found from leases or dnsmasq.conf, try local ARP
-        if [[ -z "$mac" ]]; then
-            mac=$(arp "$ip" 2>/dev/null | grep -oE '([0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2}' | head -1)
-            mac="${mac:l}"
-        fi
-
-    else
-        # Input is hostname search - search macmap.tmp
-        echo "${_EBT_COLORS[cyan]}Searching for hostname matching '$host'...${_EBT_COLORS[reset]}"
-
-        # Ensure macmap.tmp exists
-        if [[ ! -f "$_EBT_MACMAP_FILE" ]]; then
-            echo "  MAC mapping file not found, building..."
-            map_macs
-        fi
-
-        # Search for matching hostnames (case-insensitive)
-        local -a matches
-        local match_line
-        while IFS=$'\t' read -r match_mac match_hostname; do
-            [[ -z "$match_mac" ]] && continue
-            if [[ "${match_hostname:l}" == *"${host:l}"* ]]; then
-                matches+=("$match_mac|$match_hostname")
-            fi
-        done < "$_EBT_MACMAP_FILE"
-
-        # No matches found
-        if [[ ${#matches} -eq 0 ]]; then
-            echo "${_EBT_COLORS[red]}Could not find hostname containing '$host'${_EBT_COLORS[reset]}"
-            return 1
-        fi
-
-        # Display matches for selection
-        echo ""
-        echo "${_EBT_COLORS[bold]}Found ${#matches} matching device(s):${_EBT_COLORS[reset]}"
-        echo ""
-        local i=1
-        for match in "${matches[@]}"; do
-            local m_mac="${match%%|*}"
-            local m_host="${match#*|}"
-            local display_mac="$m_mac"
-            [[ "$mask_mac" == "true" ]] && display_mac=$(_ebt_mask_mac "$m_mac")
-            printf "  ${_EBT_COLORS[yellow]}%2d${_EBT_COLORS[reset]}) %-20s %s\n" "$i" "$display_mac" "${m_host:-(unnamed)}"
-            ((i++))
-        done
-        echo ""
-        echo "   ${_EBT_COLORS[yellow]}0${_EBT_COLORS[reset]}) Cancel"
-        echo ""
-
-        local selection
-        read "selection?Select device [0-${#matches}]: "
-
-        # Validate selection
-        if [[ ! "$selection" =~ ^[0-9]+$ ]] || [[ "$selection" -lt 0 ]] || [[ "$selection" -gt ${#matches} ]]; then
-            echo "Invalid selection."
-            return 1
-        fi
-
-        if [[ "$selection" -eq 0 ]]; then
-            echo "Cancelled."
-            return 0
-        fi
-
-        # Get selected device
-        local selected="${matches[$selection]}"
-        mac="${selected%%|*}"
-        hostname="${selected#*|}"
-
-        # Try to find IP from DHCP data
-        leases=$(_ebt_ssh "$primary_ip" "cat /var/lib/misc/dnsmasq.leases 2>/dev/null")
-        local lease_line
-        lease_line=$(echo "$leases" | grep -i "$mac")
-        if [[ -n "$lease_line" ]]; then
-            ip=$(echo "$lease_line" | awk '{print $3}')
-        fi
-    fi
-
-    # Exit if no device found
-    if [[ -z "$mac" ]]; then
-        echo "${_EBT_COLORS[red]}No device found matching: $host${_EBT_COLORS[reset]}"
-        return 1
-    fi
-
-    # Display device info
-    local display_mac="$mac"
-    [[ "$mask_mac" == "true" ]] && display_mac=$(_ebt_mask_mac "$mac")
-
-    echo ""
-    echo "${_EBT_COLORS[bold]}${_EBT_COLORS[cyan]}Device Found:${_EBT_COLORS[reset]}"
-    echo "  Hostname: ${_EBT_COLORS[green]}${hostname:-unknown}${_EBT_COLORS[reset]}"
-    echo "  IP:       ${_EBT_COLORS[green]}${ip:-unknown}${_EBT_COLORS[reset]}"
-    echo "  MAC:      ${_EBT_COLORS[green]}${display_mac}${_EBT_COLORS[reset]}"
-    echo ""
-    echo "Options:"
-    echo "  ${_EBT_COLORS[yellow]}e${_EBT_COLORS[reset]} - Exit"
-    echo "  ${_EBT_COLORS[yellow]}b${_EBT_COLORS[reset]} - Block device (silent DROP)"
-    echo "  ${_EBT_COLORS[yellow]}r${_EBT_COLORS[reset]} - Block device (REJECT - sends RST/ICMP, faster client timeout)"
-    echo "  ${_EBT_COLORS[yellow]}u${_EBT_COLORS[reset]} - Unblock device"
-    echo ""
-    read "choice?Enter choice [e/b/r/u]: "
-
-    local device_info="${hostname:-unknown} (${ip:-$display_mac})"
-
-    case "$choice" in
-        u|U)
-            echo ""
-            echo "${_EBT_COLORS[cyan]}Unblocking $display_mac on all routers...${_EBT_COLORS[reset]}"
-            for rtr_ip in ${(ko)_EBT_ROUTERS}; do
-                local shortname=$(_ebt_get_shortname "$rtr_ip")
-                echo "  → $shortname"
-                _ebt_unblock_mac "$rtr_ip" "$mac"
-            done
-            echo "${_EBT_COLORS[green]}Done. Device unblocked.${_EBT_COLORS[reset]}"
-            _ebt_show_mac_status "$mac" "$device_info" "$mask_mac"
-            ;;
-        b|B)
-            echo ""
-            echo "${_EBT_COLORS[cyan]}Blocking $display_mac on all routers (silent DROP)...${_EBT_COLORS[reset]}"
-            for rtr_ip in ${(ko)_EBT_ROUTERS}; do
-                local shortname=$(_ebt_get_shortname "$rtr_ip")
-                echo "  → $shortname"
-                _ebt_block_mac "$rtr_ip" "$mac"
-            done
-            echo "${_EBT_COLORS[green]}Done. Device blocked at Layer 2 (silent DROP).${_EBT_COLORS[reset]}"
-            _ebt_show_mac_status "$mac" "$device_info" "$mask_mac"
-            ;;
-        r|R)
-            echo ""
-            echo "${_EBT_COLORS[cyan]}Blocking $display_mac on all routers (REJECT mode)...${_EBT_COLORS[reset]}"
-            for rtr_ip in ${(ko)_EBT_ROUTERS}; do
-                local shortname=$(_ebt_get_shortname "$rtr_ip")
-                echo "  → $shortname"
-                _ebt_block_mac_reject "$rtr_ip" "$mac"
-            done
-            echo "${_EBT_COLORS[green]}Done. Device blocked (REJECT mode - clients will receive RST/ICMP).${_EBT_COLORS[reset]}"
-            _ebt_show_mac_status "$mac" "$device_info" "$mask_mac"
-            ;;
-        *)
-            echo "Exiting."
-            ;;
-    esac
 }
